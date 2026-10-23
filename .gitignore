@@ -1,0 +1,13 @@
+# Secrets - NEVER commit these
+.env
+.streamlit/secrets.toml
+
+# Local database (contains your analysis history)
+soc_history.db
+
+# Python / VS Code
+venv/
+.venv/
+__pycache__/
+*.pyc
+.vscode/

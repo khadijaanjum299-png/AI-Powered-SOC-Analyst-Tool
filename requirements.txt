@@ -1,0 +1,5 @@
+streamlit>=1.36
+openai>=1.30
+requests
+fpdf2
+python-dotenv
