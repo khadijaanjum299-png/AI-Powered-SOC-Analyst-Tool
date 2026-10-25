@@ -60,6 +60,22 @@ MODEL_PRICING = {
     "gpt-4.1": (2.00, 8.00),
 }
 
+# AI providers. Every one of them speaks the OpenAI API format, so the same `openai`
+# library is used for all - only base_url, key and model name change.
+# Model names change over time: check each provider's dashboard if one is rejected.
+PROVIDERS = {
+    "openai": {"label": "OpenAI (paid)", "base_url": None, "key_env": "OPENAI_API_KEY",
+               "models": list(MODEL_PRICING)},
+    "groq": {"label": "Groq (free tier)", "base_url": "https://api.groq.com/openai/v1",
+             "key_env": "GROQ_API_KEY",
+             "models": ["openai/gpt-oss-20b", "openai/gpt-oss-120b", "llama-3.3-70b-versatile"]},
+    "gemini": {"label": "Google Gemini (free tier)",
+               "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
+               "key_env": "GEMINI_API_KEY", "models": ["gemini-2.5-flash", "gemini-2.5-flash-lite"]},
+    "openrouter": {"label": "OpenRouter (free models)", "base_url": "https://openrouter.ai/api/v1",
+                   "key_env": "OPENROUTER_API_KEY", "models": ["openrouter/free"]},
+}
+
 SEVERITIES = ["Informational", "Low", "Medium", "High", "Critical"]
 SEVERITY_ICON = {"Informational": "⚪", "Low": "🔵", "Medium": "🟡", "High": "🟠", "Critical": "🔴"}
 ALERT_SEVERITIES = {"High", "Critical"}
@@ -212,18 +228,41 @@ Respond with ONLY a JSON object with these keys:
 
 
 def analyze_with_openai(client, model: str, masked_log: str):
-    """Send ONE masked log to OpenAI. Returns (analysis_dict, prompt_tokens, completion_tokens)."""
-    response = client.chat.completions.create(
-        model=model,
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": masked_log},
-        ],
-        response_format={"type": "json_object"},
-    )
-    data = json.loads(response.choices[0].message.content)
-    usage = response.usage  # Feature 6: real token counts reported by the API
-    return normalize_analysis(data), usage.prompt_tokens, usage.completion_tokens
+    """Send ONE masked log to the AI. Returns (analysis_dict, prompt_tokens, completion_tokens)."""
+    kwargs = dict(model=model, messages=[
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": masked_log},
+    ])
+    try:
+        response = client.chat.completions.create(**kwargs, response_format={"type": "json_object"})
+    except Exception as exc:
+        # Some free models do not support JSON mode -> retry without it.
+        if exc.__class__.__name__ in ("BadRequestError", "UnprocessableEntityError"):
+            response = client.chat.completions.create(**kwargs)
+        else:
+            raise
+    content = response.choices[0].message.content or ""
+    found = re.search(r"\{.*\}", content, re.S)  # tolerate extra text around the JSON
+    data = json.loads(found.group(0) if found else content)
+    usage = response.usage  # Feature 6: token counts reported by the API
+    if usage is not None:
+        pt, ct = usage.prompt_tokens, usage.completion_tokens
+    else:  # a few providers omit usage -> rough estimate (~4 characters per token)
+        pt, ct = (len(SYSTEM_PROMPT) + len(masked_log)) // 4, len(content) // 4
+    return normalize_analysis(data), pt, ct
+
+
+def analyze_with_retry(client, model: str, masked_log: str, attempts: int = 4):
+    """Free tiers have low rate limits: on a 429 wait and try again (but not when quota is exhausted)."""
+    for i in range(attempts):
+        try:
+            return analyze_with_openai(client, model, masked_log)
+        except Exception as exc:
+            rate_limited = exc.__class__.__name__ == "RateLimitError"
+            if rate_limited and "insufficient_quota" not in str(exc) and i < attempts - 1:
+                time.sleep(15 * (i + 1))
+                continue
+            raise
 
 
 def normalize_analysis(data: dict) -> dict:
@@ -311,6 +350,8 @@ def send_alert(cfg: dict, record: dict):
     )
     try:
         channel = cfg["alert_channel"]
+        if not channel:
+            return False, "No alert channel configured in .env"
         if channel in ("Discord webhook", "Slack webhook"):
             if not cfg["webhook_url"]:
                 return False, "No webhook URL configured"
@@ -487,9 +528,39 @@ def login_screen():
     st.caption("Demo accounts: admin / admin123 (Admin) and junior / junior123 (Junior Analyst).")
 
 
-def render_sidebar() -> dict:
+def load_config() -> dict:
+    """All settings come from .env / environment variables / Streamlit secrets - no keys in the UI."""
+    env = lambda name: get_secret("", name)
+    chosen = env("AI_PROVIDER").lower()
+    if chosen not in PROVIDERS:  # not set -> use the first provider that has a key
+        chosen = next((n for n in PROVIDERS if env(PROVIDERS[n]["key_env"])), "openai")
+    prov = PROVIDERS[chosen]
+    cfg = {"provider": chosen, "base_url": prov["base_url"], "key_env": prov["key_env"],
+           "openai_key": env(prov["key_env"]), "model": env("AI_MODEL") or prov["models"][0]}
+    cfg["demo"] = env("DEMO_MODE").lower() in ("1", "true", "yes", "on")
+    try:
+        cfg["delay"] = float(env("AI_DELAY_SECONDS") or 0)  # pause between calls (free-tier rate limits)
+    except ValueError:
+        cfg["delay"] = 0.0
+    cfg["extra_users"] = [u.strip() for u in env("EXTRA_MASK_USERS").split(",") if u.strip()]
+    cfg["abuse_key"] = env("ABUSEIPDB_API_KEY")
+    cfg["ti_enabled"] = bool(cfg["abuse_key"])  # threat intel is on whenever a key exists
+    # Alert channel: webhook URL (Discord or Slack, detected from the URL) or SMTP email
+    cfg.update(webhook_url=env("ALERT_WEBHOOK_URL"), smtp_host=env("SMTP_HOST"),
+               smtp_port=env("SMTP_PORT") or 587, smtp_user=env("SMTP_USER"),
+               smtp_pass=env("SMTP_PASS"), email_to=env("ALERT_EMAIL_TO"))
+    if cfg["webhook_url"]:
+        cfg["alert_channel"] = "Discord webhook" if "discord" in cfg["webhook_url"] else "Slack webhook"
+    elif cfg["smtp_host"]:
+        cfg["alert_channel"] = "Email (SMTP)"
+    else:
+        cfg["alert_channel"] = ""
+    return cfg
+
+
+def render_sidebar(cfg: dict) -> dict:
+    """Sidebar: who is logged in, the alerts toggle and a read-only status line."""
     user = st.session_state.user
-    cfg = {}
     with st.sidebar:
         st.markdown(f"**👤 {user['name']}**  \nRole: `{user['role']}`")
         if st.button("Log out"):
@@ -497,35 +568,18 @@ def render_sidebar() -> dict:
             st.session_state.results = []
             st.rerun()
         st.divider()
-
-        st.header("⚙️ AI settings")
-        cfg["model"] = st.selectbox("OpenAI model", list(MODEL_PRICING), index=0)
-        cfg["demo"] = st.checkbox("Demo mode (no API call, for testing)", value=False)
-        typed = st.text_input("OpenAI API key", type="password", placeholder="sk-...",
-                              help="Or set the OPENAI_API_KEY environment variable.")
-        cfg["openai_key"] = get_secret(typed, "OPENAI_API_KEY")
-        cfg["extra_users"] = [u.strip() for u in st.text_input(
-            "Extra usernames to mask (comma-separated)").split(",") if u.strip()]
-        st.divider()
-
-        st.header("🌐 Threat intelligence")
-        cfg["ti_enabled"] = st.toggle("AbuseIPDB lookup", value=True)
-        typed = st.text_input("AbuseIPDB API key", type="password")
-        cfg["abuse_key"] = get_secret(typed, "ABUSEIPDB_API_KEY")
-        st.divider()
-
         st.header("🚨 Alerts")
         cfg["alerts_enabled"] = st.toggle("Enable High/Critical alerts", value=False)
-        cfg["alert_channel"] = st.selectbox("Channel", ["Discord webhook", "Slack webhook", "Email (SMTP)"])
-        cfg.update(webhook_url="", smtp_host="", smtp_port=587, smtp_user="", smtp_pass="", email_to="")
-        if cfg["alert_channel"].endswith("webhook"):
-            cfg["webhook_url"] = get_secret(st.text_input("Webhook URL", type="password"), "ALERT_WEBHOOK_URL")
+        if cfg["alerts_enabled"] and not cfg["alert_channel"]:
+            st.warning("No alert channel found. Add ALERT_WEBHOOK_URL to your .env file.")
+        st.divider()
+        if cfg["demo"]:
+            st.caption("🧪 Demo mode (no AI call)")
         else:
-            cfg["smtp_host"] = st.text_input("SMTP host", value="smtp.gmail.com")
-            cfg["smtp_port"] = st.number_input("SMTP port", value=587)
-            cfg["smtp_user"] = st.text_input("SMTP username / from address")
-            cfg["smtp_pass"] = st.text_input("SMTP password (app password)", type="password")
-            cfg["email_to"] = st.text_input("Send alerts to")
+            st.caption(f"🤖 {PROVIDERS[cfg['provider']]['label']} · `{cfg['model']}`  \n"
+                       f"AI key: {'✅' if cfg['openai_key'] else '❌ missing ' + cfg['key_env']}")
+        st.caption(f"🌐 AbuseIPDB: {'✅' if cfg['ti_enabled'] else '❌ no key'} · "
+                   f"🚨 Alert channel: {cfg['alert_channel'] or '❌ none'}")
     return cfg
 
 
@@ -570,12 +624,12 @@ def handle_delete_history():
 
 def run_batch(cfg: dict, lines: list):
     if not cfg["demo"] and not cfg["openai_key"]:
-        st.error("Enter your OpenAI API key in the sidebar (or tick Demo mode to test without one).")
+        st.error(f"Enter your API key in the sidebar or set {cfg['key_env']} in .env (or tick Demo mode to test without one).")
         return
     client = None
     if not cfg["demo"]:
         from openai import OpenAI
-        client = OpenAI(api_key=cfg["openai_key"])
+        client = OpenAI(api_key=cfg["openai_key"], base_url=cfg["base_url"])
 
     masker = DataMasker()  # shared across the batch -> consistent tokens
     for line in lines:     # pre-scan: learn every username first so none slips through
@@ -591,7 +645,9 @@ def run_batch(cfg: dict, lines: list):
             if cfg["demo"]:
                 analysis, pt, ct = demo_analyze(masked)
             else:
-                analysis, pt, ct = analyze_with_openai(client, cfg["model"], masked)
+                analysis, pt, ct = analyze_with_retry(client, cfg["model"], masked)
+                if cfg["delay"]:
+                    time.sleep(cfg["delay"])
             analysis = masker.restore(analysis)                         # Feature 1: restore
         except Exception as exc:
             st.warning(f"Log {i} failed: {exc}")
@@ -721,7 +777,7 @@ def main():
         login_screen()
         return
 
-    cfg = render_sidebar()
+    cfg = render_sidebar(load_config())
     st.title("🛡️ AI-Powered SOC Analyst Tool")
     metrics_box = st.container()  # filled at the end so numbers reflect this run
 
